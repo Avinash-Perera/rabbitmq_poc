@@ -1,0 +1,2 @@
+com/ecommerce/rabbitmq/OrderProducer.class
+com/ecommerce/rabbitmq/PaymentWorker.class
