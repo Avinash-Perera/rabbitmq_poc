@@ -12,47 +12,39 @@ import java.util.Map;
 
 /**
  * =========================================================================
- * LAB 2: OrderProducer with Quorum Queues & Publisher Confirms
+ * LAB 3: OrderProducer with Fanout & Topic Exchange Publishing
  * =========================================================================
  *
- * AMQP 0-9-1 MECHANICS & DISTRIBUTED SYSTEMS INTERNALS:
+ * AMQP 0-9-1 EXCHANGE TYPES & ROUTING MECHANICS:
  *
- * 1. The Immutability Rule for Queues:
- *    - In AMQP, queue declarations are idempotent IF AND ONLY IF all arguments match.
- *    - If an existing queue was declared as "classic" (Lab 1) and we now try to declare it
- *      with 'x-queue-type: quorum', RabbitMQ raises a channel exception:
- *      406 PRECONDITION_FAILED - inequivalent arg 'x-queue-type'.
- *    - Therefore, when upgrading queue types, the old queue must be deleted first
- *      via channel.queueDelete().
+ * 1. Direct Exchange ('orders.direct'):
+ *    - Strict equality: routingKey on Basic.Publish == bindingKey on Queue.Bind.
  *
- * 2. Modern Quorum Queues (x-queue-type = "quorum"):
- *    - Replaces deprecated Classic Mirrored Queues (HA).
- *    - Based on the Raft Consensus Algorithm.
- *    - Messages are replicated across a quorum (majority) of Erlang nodes before being
- *      considered committed.
- *    - Strictly FIFO, high data safety, resilient to network splits.
+ * 2. Fanout Exchange ('payment.fanout.ex'):
+ *    - 1-to-Many Broadcast.
+ *    - The broker COMPLETELY IGNORES the routing key during publication.
+ *    - Dispatches a copy of the message to EVERY queue bound to it.
  *
- * 3. Publisher Confirms (channel.confirmSelect()):
- *    - Standard basicPublish is "fire-and-forget" over the TCP socket. The producer has
- *      zero guarantee the broker received, routed, or stored the message.
- *    - When confirmSelect() is called, the client issues a METHOD Frame: Confirm.Select.
- *    - The broker switches this channel to "confirm mode" and replies with Confirm.Select-Ok.
- *    - For every basicPublish, the broker assigns an internal sequence number (1, 2, 3...).
- *    - Once the message is written to the Raft log on disk, the broker sends back an
- *      asynchronous METHOD Frame: Basic.Ack(deliveryTag=sequenceNumber).
- *    - channel.waitForConfirmsOrDie(timeout) blocks until all published messages in the batch
- *      have received their Basic.Ack frame from the broker.
- *
- * 4. Message Durability (MessageProperties.PERSISTENT_TEXT_PLAIN):
- *    - Sets 'deliveryMode = 2' inside the AMQP Content Header frame.
- *    - Tells the broker's storage engine to write the payload to disk/Raft log rather than
- *      relying purely on RAM memory buffers.
+ * 3. Topic Exchange ('logs.topic.ex'):
+ *    - Pattern-matching pub/sub based on dot-delimited tokens (e.g., '<region>.<service>.<severity>').
+ *    - Wildcard Rules in AMQP:
+ *      * (asterisk): Matches EXACTLY ONE word.
+ *        Example: '*.payment.error' matches 'eu.payment.error' and 'us.payment.error',
+ *                 but NOT 'payment.error' or 'eu.west.payment.error'.
+ *      # (hash): Matches ZERO OR MORE words.
+ *        Example: 'eu.#' matches 'eu.order.created', 'eu.payment.error', and 'eu'.
+ *    - Internal Broker Trie:
+ *      RabbitMQ uses a high-performance routing trie in Erlang memory to match topic patterns
+ *      in sub-microsecond time.
  */
 public class OrderProducer {
 
-    public static final String EXCHANGE_NAME = "orders.direct";
-    public static final String QUEUE_NAME = "orders.payment";
-    public static final String ROUTING_KEY = "order.created";
+    public static final String DIRECT_EXCHANGE = "orders.direct";
+    public static final String FANOUT_EXCHANGE = "payment.fanout.ex";
+    public static final String TOPIC_EXCHANGE = "logs.topic.ex";
+
+    public static final String PAYMENT_QUEUE = "orders.payment";
+    public static final String ORDER_ROUTING_KEY = "order.created";
 
     public static void main(String[] args) {
         ConnectionFactory factory = new ConnectionFactory();
@@ -65,63 +57,62 @@ public class OrderProducer {
         try (Connection connection = factory.newConnection();
              Channel channel = connection.createChannel()) {
 
-            System.out.println("[Producer] Connected. Channel ID: " + channel.getChannelNumber());
-
-            // 1. Enable Publisher Confirms on this channel
             channel.confirmSelect();
-            System.out.println("[Producer] [✓] Publisher Confirms enabled (Confirm.Select wire frame sent)");
 
-            // 2. Declare Durable Direct Exchange
-            channel.exchangeDeclare(EXCHANGE_NAME, BuiltinExchangeType.DIRECT, true, false, null);
-
-            // 3. Declare Modern Quorum Queue
-            // Note: If orders.payment exists from Lab 1 as a classic queue, delete it first
-            // to avoid 406 PRECONDITION_FAILED when changing queue engine type to Quorum.
-            try {
-                channel.queueDelete(QUEUE_NAME);
-                System.out.println("[Producer] Deleted legacy queue to upgrade to Quorum type.");
-            } catch (Exception ignored) {
-                // Queue didn't exist, proceed
-            }
-
+            // 1. Declare Direct Exchange & Quorum Queue for Order Processing
+            channel.exchangeDeclare(DIRECT_EXCHANGE, BuiltinExchangeType.DIRECT, true, false, null);
             Map<String, Object> queueArgs = new HashMap<>();
-            queueArgs.put("x-queue-type", "quorum"); // Declares a Raft-replicated Quorum Queue
+            queueArgs.put("x-queue-type", "quorum");
+            channel.queueDeclare(PAYMENT_QUEUE, true, false, false, queueArgs);
+            channel.queueBind(PAYMENT_QUEUE, DIRECT_EXCHANGE, ORDER_ROUTING_KEY);
 
-            channel.queueDeclare(QUEUE_NAME, true, false, false, queueArgs);
-            channel.queueBind(QUEUE_NAME, EXCHANGE_NAME, ROUTING_KEY);
-            System.out.println("[Producer] [✓] Declared Quorum Queue: '" + QUEUE_NAME + "' (type: quorum, durable: true)");
+            // 2. Declare Fanout Exchange (Broadcasts completed payments)
+            channel.exchangeDeclare(FANOUT_EXCHANGE, BuiltinExchangeType.FANOUT, true, false, null);
 
-            // 4. Publish a batch of 6 orders to test Competing Consumers & Load Balancing
-            int totalOrders = 6;
-            System.out.println("\n[Producer] Publishing batch of " + totalOrders + " persistent orders...");
+            // 3. Declare Topic Exchange (Broadcasts regional system & audit logs)
+            channel.exchangeDeclare(TOPIC_EXCHANGE, BuiltinExchangeType.TOPIC, true, false, null);
 
-            for (int i = 1; i <= totalOrders; i++) {
-                String orderPayload = String.format("{\"orderId\":\"ORD-%04d\",\"item\":\"Item-%d\",\"amount\":%d.00}",
-                        1000 + i, i, 50 * i);
+            System.out.println("[Producer] Topologies declared: Direct, Fanout, and Topic Exchanges.");
 
-                /*
-                 * MessageProperties.PERSISTENT_TEXT_PLAIN:
-                 * Encodes deliveryMode = 2 in the AMQP Content Header frame.
-                 * Tells the broker: "Fsync this to disk before acking."
-                 */
-                channel.basicPublish(
-                        EXCHANGE_NAME,
-                        ROUTING_KEY,
-                        MessageProperties.PERSISTENT_TEXT_PLAIN,
-                        orderPayload.getBytes(StandardCharsets.UTF_8)
-                );
+            // 4. Publish 2 Orders to Direct Exchange
+            System.out.println("\n--- [1] Publishing Orders to Direct Exchange ---");
+            publishOrder(channel, "{\"orderId\":\"ORD-3001\",\"item\":\"Gaming Mouse\",\"amount\":79.99}");
+            publishOrder(channel, "{\"orderId\":\"ORD-3002\",\"item\":\"4K Monitor\",\"amount\":349.99}");
 
-                System.out.println("  -> Dispatched: " + orderPayload);
-            }
+            // 5. Publish Regional Topic Logs with different routing keys
+            System.out.println("\n--- [2] Publishing Regional Logs to Topic Exchange ---");
+            publishTopicLog(channel, "us.order.info", "US-East region: New order pipeline initialized");
+            publishTopicLog(channel, "eu.payment.error", "EU-Central region: Payment gateway timeout detected");
+            publishTopicLog(channel, "us.payment.error", "US-West region: Card processor rejected transaction");
+            publishTopicLog(channel, "eu.order.warn", "EU-West region: Low inventory threshold warning");
+            publishTopicLog(channel, "asia.order.info", "Asia region: Order batch dispatched");
 
-            // 5. Block and wait for Broker Acks for all 6 messages
-            System.out.println("\n[Producer] Waiting for Broker Publisher Confirms (Basic.Ack)...");
             channel.waitForConfirmsOrDie(5000);
-            System.out.println("[Producer] [✓✓✓] All 6 orders safely committed to disk by RabbitMQ!");
+            System.out.println("\n[Producer] [✓] All orders and topic logs successfully published & confirmed!");
 
         } catch (Exception e) {
             System.err.println("[Producer] Error: " + e.getMessage());
             e.printStackTrace();
         }
+    }
+
+    private static void publishOrder(Channel channel, String payload) throws Exception {
+        channel.basicPublish(
+                DIRECT_EXCHANGE,
+                ORDER_ROUTING_KEY,
+                MessageProperties.PERSISTENT_TEXT_PLAIN,
+                payload.getBytes(StandardCharsets.UTF_8)
+        );
+        System.out.println("  -> Dispatched Order: " + payload);
+    }
+
+    private static void publishTopicLog(Channel channel, String routingKey, String logMessage) throws Exception {
+        channel.basicPublish(
+                TOPIC_EXCHANGE,
+                routingKey,
+                null,
+                logMessage.getBytes(StandardCharsets.UTF_8)
+        );
+        System.out.println("  -> Dispatched Topic Log [" + routingKey + "]: " + logMessage);
     }
 }

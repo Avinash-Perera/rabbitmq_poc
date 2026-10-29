@@ -1,2 +1,4 @@
 com/ecommerce/rabbitmq/OrderProducer.class
 com/ecommerce/rabbitmq/PaymentWorker.class
+com/ecommerce/rabbitmq/BroadcastWorkers.class
+com/ecommerce/rabbitmq/TopicLogWorker.class
